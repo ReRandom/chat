@@ -57,13 +57,13 @@ void delete_pid_file(char* filename);
 int check_pid_file(char*filename);
 
 void* listening(void* arg);
-void* connecting(void* arg);
+void* connecting(void* port);
 
-int init_work_thread();
+int init_work_thread(unsigned short int port);
 int destroy_work_thread();
 
-int my_daemon();
-int monitor();
+int my_daemon(unsigned short int port);
+int monitor(char* pid_file_name, unsigned short int port);
 
 void write_log(char* filename, char* msg, int flags);
 
@@ -535,7 +535,7 @@ void* listening(void* arg)
 
 
 /* Установка соединения с новым клиентом. */
-void* connecting(void* arg)
+void* connecting(void* port)
 {
     //Сокет для приёма входящих подключений.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -546,14 +546,16 @@ void* connecting(void* arg)
     {
         write_log(NULL, "[Server] Error: creating socket", ERRNO_FLAG);
         kill(getpid(), SIGTERM);
+        free(port);
         pthread_exit(NULL);
     }
 
-    //Прослушиваем TCP, порт 13000.
+    //Прослушиваем TCP, с указанного порта.
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(13000);
+    addr.sin_port = htons(*(unsigned short int*)port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    free(port);
 
     if(bind(sock, (struct sockaddr *) &addr, sizeof(addr)) != 0)
     {
@@ -767,9 +769,11 @@ static void signal_error(int sig, siginfo_t *si, void *ptr)
     exit(CHILD_NEED_WORK);
 }
 
-int init_work_thread()
+int init_work_thread(unsigned short int p)
 {
-    switch(pthread_create(&thread_connecting, NULL, connecting, NULL))
+    unsigned short int* port = (unsigned short int*)malloc(sizeof(unsigned short int));
+    *port = p;
+    switch(pthread_create(&thread_connecting, NULL, connecting, port))
     {
         case 0:
         {
@@ -824,7 +828,7 @@ int destroy_work_thread()
     }
 }
 
-int my_daemon()
+int my_daemon(unsigned short int port)
 {
     int status = 0;
 
@@ -903,7 +907,7 @@ int my_daemon()
     write_log(NULL, "[DAEMON] Started", 0);
 
     // запускаем потоки
-    status = init_work_thread();
+    status = init_work_thread(port);
     if (!status)
     {
         int signo;
@@ -948,7 +952,7 @@ int my_daemon()
     return CHILD_NEED_TERMINATE;
 }
 
-int monitor(char* pid_file_name)
+int monitor(char* pid_file_name, unsigned short int port)
 {
     sigset_t sigset;
 
@@ -1023,7 +1027,7 @@ int monitor(char* pid_file_name)
         else if (pid == 0) // если мы потомок
         {
             // запустим функцию отвечающую за работу демона
-            status = my_daemon();
+            status = my_daemon(port);
             exit(status);
         }
         // если мы родитель
@@ -1117,6 +1121,7 @@ int main(int argc, char** argv)
 {
     pid_t pid;
     char* pid_file_name = NULL;
+    unsigned short int port = 13000;
 
     int interactive = 0;
     {
@@ -1135,9 +1140,13 @@ int main(int argc, char** argv)
             {
                 pid_file_name = argv[++i];
             }
+            else if(strcmp(argv[i], "-port") == 0)
+            {
+                port = (unsigned short int)atoi(argv[++i]);
+            }
             else if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
             {
-                printf("Usage: %s -l logfile -pid PID_file_name [-i]\n", argv[0]);
+                printf("Usage: %s -l logfile -pid PID_file_name [-i] [-port port]\n", argv[0]);
                 return 0;
             }
             else
@@ -1148,7 +1157,7 @@ int main(int argc, char** argv)
         }
         if ((log_file_name == NULL && interactive == 0) || pid_file_name == NULL)
         {
-            printf("Usage: %s -l logfile -pid PID_file_name [-i]\n", argv[0]);
+            printf("Usage: %s -l logfile -pid PID_file_name [-i] [-port port]\n", argv[0]);
             return -1;
         }
         if(log_file_name != NULL)
@@ -1203,7 +1212,7 @@ int main(int argc, char** argv)
     if(interactive)
     {
         umask(0);
-        int status = monitor(pid_file_name);
+        int status = monitor(pid_file_name, port);
         write_log(NULL, NULL, MUTEX_DESTROY_FLAG);
         return status;
     }
@@ -1245,7 +1254,7 @@ int main(int argc, char** argv)
         }
         
         // Данная функция будет осуществлять слежение за процессом
-        status = monitor(pid_file_name);
+        status = monitor(pid_file_name, port);
         write_log(NULL, NULL, MUTEX_DESTROY_FLAG);
         return status;
     }
