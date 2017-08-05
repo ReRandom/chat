@@ -47,7 +47,6 @@ struct client
 };
 
 pthread_t thread_connecting;
-char* pid_file;
 
 static void signal_error(int sig, siginfo_t *si, void *ptr);
 
@@ -78,7 +77,7 @@ void write_syslog(char* msg)
 
 //Печать сообщений в лог файл
 /* Хранит путь к логу самостоятельно, т.е. каждый раз указывать flename не нужно, достаточно вызвать
-   первый раз с указанием пути, либо вызвать с указанием пути, но msg = NULL (так же можно изменять),
+   первый раз с указанием пути, либо вызвать с указанием пути, но msg = NULL (также можно изменять),
    в прочих случаях (когда путь к логу уже сохранён), можно присвоить filename NULL.
    Флаги:
    ERRNO_FLAG           - Вывод переменной errno
@@ -347,9 +346,38 @@ int check_pid_file(char* filename)
     struct stat buf;
     stat(filename, &buf);
     if(errno == ENOENT)
+    {
+        //Проверяем возможность создать pid файл
+        {
+            FILE* pid_f = fopen(filename, "w");
+            if(pid_f == 0)
+            {
+                wrap_perror("[Check PID] Error of opening PID file")
+                return 2;
+            }
+            else
+            {
+                if(fclose(pid_f) == EOF)
+                {
+                    wrap_perror("[Check PID] Error of closing PID file")
+                    return 2;
+                }
+                else
+                {
+                    if(unlink(filename) < 0)
+                    {
+                        wrap_perror("[Check PID Error of deleting PID file")
+                        return 2;
+                    }
+                }
+            }
+        }
         return 0;
+    }
     else
+    {
         return 1;
+    }
 }
 
 /* Прослушивание сообщений от клиента.
@@ -920,7 +948,7 @@ int my_daemon()
     return CHILD_NEED_TERMINATE;
 }
 
-int monitor()
+int monitor(char* pid_file_name)
 {
     sigset_t sigset;
 
@@ -968,7 +996,7 @@ int monitor()
     }
 
     // данная функция создаст файл с нашим PID'ом
-    status = set_pid_file(pid_file);
+    status = set_pid_file(pid_file_name);
     if(status != 0)
     {
         write_log(NULL, "[MONITOR] Error: Failed to set a PID file", 0);
@@ -1080,7 +1108,7 @@ int monitor()
     write_log(NULL, "[MONITOR] Stop", 0);
     
     // удалим файл с PID'ом
-    delete_pid_file(pid_file);
+    delete_pid_file(pid_file_name);
     
     return status;
 }
@@ -1088,7 +1116,7 @@ int monitor()
 int main(int argc, char** argv)
 {
     pid_t pid;
-    pid_file = NULL;
+    char* pid_file_name = NULL;
 
     int interactive = 0;
     {
@@ -1105,11 +1133,11 @@ int main(int argc, char** argv)
             }
             else if(strcmp(argv[i], "-pid") == 0)
             {
-                pid_file = argv[++i];
+                pid_file_name = argv[++i];
             }
             else if(strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0)
             {
-                printf("Usage: %s -l logfile -pid PID_file [-i]\n", argv[0]);
+                printf("Usage: %s -l logfile -pid PID_file_name [-i]\n", argv[0]);
                 return 0;
             }
             else
@@ -1118,9 +1146,9 @@ int main(int argc, char** argv)
                 return 2;
             }
         }
-        if ((log_file_name == NULL && interactive == 0) || pid_file == NULL)
+        if ((log_file_name == NULL && interactive == 0) || pid_file_name == NULL)
         {
-            printf("Usage: %s -l logfile -pid pid_file [-i]\n", argv[0]);
+            printf("Usage: %s -l logfile -pid PID_file_name [-i]\n", argv[0]);
             return -1;
         }
         if(log_file_name != NULL)
@@ -1152,38 +1180,30 @@ int main(int argc, char** argv)
                 }
             }
         }
-        //Проверяем доступность pid файла
-        {
-            FILE* pid_f = fopen(pid_file, "w");
-            if(pid_f == 0)
-            {
-                wrap_perror("Error opening PID file")
-                return 1;
-            }
-            else
-            {
-                if(fclose(pid_f) == EOF)
-                {
-                    wrap_perror("Error closing PID file")
-                }
-                else
-                {
-                    unlink(pid_file);
-                }
-            }
-        }
     }
 
-    if(check_pid_file(pid_file))
+    switch(check_pid_file(pid_file_name))
     {
-        print_error("deamon is already running")
-        return 3;
+        case 0:
+            break;
+        case 1:
+        {
+            print_error("deamon is already running")
+            return 3;
+        }
+        case 2:
+        {
+            print_error("error creating PID file");
+            return 3;
+        }
+        default:
+            return 3;
     }
 
     if(interactive)
     {
         umask(0);
-        int status = monitor();
+        int status = monitor(pid_file_name);
         write_log(NULL, NULL, MUTEX_DESTROY_FLAG);
         return status;
     }
@@ -1225,7 +1245,7 @@ int main(int argc, char** argv)
         }
         
         // Данная функция будет осуществлять слежение за процессом
-        status = monitor();
+        status = monitor(pid_file_name);
         write_log(NULL, NULL, MUTEX_DESTROY_FLAG);
         return status;
     }
