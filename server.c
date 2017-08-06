@@ -545,7 +545,7 @@ void* connecting(void* port)
     if(sock == -1)
     {
         write_log(NULL, "[Server] Error: creating socket", ERRNO_FLAG);
-        kill(getpid(), SIGTERM);
+        raise(SIGTERM);
         free(port);
         pthread_exit(NULL);
     }
@@ -564,7 +564,7 @@ void* connecting(void* port)
         {
             write_log(NULL, "[Server] Error: Failed to close bind socket", ERRNO_FLAG);
         }
-        kill(getpid(), SIGTERM);
+        raise(SIGTERM);
         pthread_exit(NULL);
     }
     if (listen(sock, SOMAXCONN) != 0)
@@ -574,7 +574,7 @@ void* connecting(void* port)
         {
             write_log(NULL, "[Server] Error: Failed to close bind socket", ERRNO_FLAG);
         }
-        kill(getpid(), SIGTERM);
+        raise(SIGTERM);
         pthread_exit(NULL);
     }
     write_log(NULL, "[Server] Started", 0);
@@ -623,7 +623,7 @@ void* connecting(void* port)
                 }
                 free(client_sock);
                 free(client_addr);
-                kill(getpid(), SIGTERM);
+                raise(SIGTERM);
                 pthread_exit(NULL);
             }
         }
@@ -638,7 +638,7 @@ void* connecting(void* port)
             }
             free(client_sock);
             free(client_addr);
-            kill(getpid(), SIGTERM);
+            raise(SIGTERM);
             pthread_exit(NULL);
         }
 
