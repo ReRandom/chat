@@ -169,7 +169,7 @@ void write_log(char* filename, char* msg, int flags)
             if(flags & ERRNO_FLAG)
                 syslog(LOG_ERR, "%s errno: %s", msg, strerror(errno));
             else
-                syslog(LOG_ERR, "%s", msg);
+                syslog(LOG_NOTICE, "%s", msg);
 
             //Выход из критической области.
             if(pthread_mutex_unlock(&mutex) != 0)
@@ -222,7 +222,7 @@ void write_log(char* filename, char* msg, int flags)
             //Если не удаётся писать в файл - пишем в syslog
             openlog("my_server", LOG_PID, LOG_USER);
         
-            syslog(LOG_ERR, "%s", msg);
+            syslog(LOG_NOTICE, "%s", msg);
 
             //Если запущен в режиме демона, значит открывал файл, который надо бы закрыть.
             if(!interactive)
@@ -256,7 +256,7 @@ void write_log(char* filename, char* msg, int flags)
             if(flags & ERRNO_FLAG)
                 syslog(LOG_ERR, "%s errno: %s", msg, strerror(errno));
             else
-                syslog(LOG_ERR, "%s", msg);
+                syslog(LOG_NOTICE, "%s", msg);
 
             //Выход из критической области.
             if(pthread_mutex_unlock(&mutex) != 0)
