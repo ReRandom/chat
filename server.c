@@ -44,11 +44,14 @@ struct client
     struct sockaddr_in* addr;
     char* name;
     int* socket;
+    pthread_t* thread;
+    unsigned char volatile* exit_flag;
 };
 
 pthread_t thread_connecting;
+volatile unsigned char connecting_exit_flag;
 
-static void signal_error(int sig, siginfo_t *si, void *ptr);
+void signal_error(int sig, siginfo_t *si, void *ptr);
 
 void set_fd_limit(int MaxFd);
 
@@ -57,7 +60,7 @@ void delete_pid_file(char* filename);
 int check_pid_file(char*filename);
 
 void* listening(void* arg);
-void* connecting(void* port);
+void* connecting(void* arg);
 
 int init_work_thread(unsigned short int port);
 int destroy_work_thread();
@@ -385,33 +388,6 @@ int check_pid_file(char* filename)
    В качестве параметра ожидает struct client**.*/
 void* listening(void* arg)
 {
-    sigset_t sigset;
-
-    if(sigemptyset(&sigset) != 0)
-    {
-        write_log(NULL, "[LISTENING] Error: Failed to create empty blocker of a signal handler", ERRNO_FLAG);
-    }
-    // блокируем сигналы которые будем ожидать
-
-    // сигнал остановки процесса пользователем
-    if(sigaddset(&sigset, SIGQUIT) != 0)
-    {
-        write_log(NULL, "[LISTENING] Error: Failed to add SIGQUIT to blocker", ERRNO_FLAG);
-    }
-    // сигнал для остановки процесса пользователем с терминала
-    if(sigaddset(&sigset, SIGINT) != 0)
-    {
-        write_log(NULL, "[LISTENING] Error: Failed to add SIGINT to blocker", ERRNO_FLAG);
-    }
-    // сигнал запроса завершения процесса
-    if(sigaddset(&sigset, SIGTERM) != 0)
-    {
-        write_log(NULL, "[LISTENING] Error: Failed to add SIGTERM to blocker", ERRNO_FLAG);
-    }
-    if(sigprocmask(SIG_BLOCK, &sigset, NULL) != 0)
-    {
-        write_log(NULL, "[LISTENING] Error: Failed to apply blocker of a signal handler", ERRNO_FLAG);
-    }
     //Буфер для хранения части сообщения
     char buf[64];
 
@@ -421,7 +397,63 @@ void* listening(void* arg)
     size_t size_message = 0;
     while(1)
     {
-        //Чтение пришедшего сообщения (блокируется)
+        /* Ниже вызов select, который вернёт значение, большее 0, только если в потоке
+           будет что читать (т.е. приёт запрос на подключение), благодаря этому вызов
+           accept не заблокирует поток и даст спокойно себя завершить*/
+        {
+            int sel_ret = 0;
+            int flag = 0;
+            while(sel_ret == 0)
+            {
+                fd_set set;
+                struct timeval tv;
+                FD_ZERO(&set);
+                FD_SET(*((struct client*)arg)->socket, &set);
+                tv.tv_sec = 1;
+                tv.tv_usec = 0;
+                sel_ret = select(*((struct client*)arg)->socket+1, &set, NULL, NULL, &tv);
+                //Если пора закрываться
+                if(*((struct client*)arg)->exit_flag)
+                {
+                    //Пишем об этом в лог, с указанием ip и порта клиента
+                    uint32_t ip = ntohl(((struct client*)arg)->addr->sin_addr.s_addr);
+                    uint16_t port = ntohs(((struct client*)arg)->addr->sin_port);
+                    
+                    /* Максимальная длинна строки с ip адресом - 15 (255.255.255.255)
+                       Максимальная длинна строки с портом - 6 (:65535)
+                       1 символ конца строки. */
+                    char* str = (char*)malloc(sizeof(char)*(15+6+strlen("[] Connection lost")+1));
+
+                    if(str == NULL)
+                    {
+                        write_log(NULL, "[LISTENING] Connection lost", 0);
+                        write_log(NULL, "[LISTENING] Error: Failed to allocate memory", 0);
+                        break;
+                    }
+                    if(sprintf(str, "[%hhu.%hhu.%hhu.%hhu:%hu] Connection lost", ip_to_bytes(ip), port) < 0)
+                    {
+                        write_log(NULL, "[LISTENING] Connection lost", 0);
+                        write_log(NULL, "[LISTENING] Error: sprintf failed", 0);
+                    }
+                    else
+                    {
+                        write_log(NULL, str, 0);
+                    }
+                    free(str);
+                    flag = 1;
+                    break;
+                }
+            }
+            if(flag)
+                break;
+            if(sel_ret == -1)
+            {
+                write_log(NULL, "[LISTENING] Error: pselect", ERRNO_FLAG);
+                break;
+            }
+        }
+
+        //Чтение пришедшего сообщения
         ssize_t bytes_read = recv(*((struct client*)arg)->socket, buf, sizeof(buf), 0);
         if(bytes_read <= 0) //Разрыв соединения
         {
@@ -527,6 +559,8 @@ void* listening(void* arg)
     free(((struct client*)arg)->socket);
     free(((struct client*)arg)->addr);
     free(((struct client*)arg)->name);
+    free(((struct client*)arg)->thread);
+    free((void*)((struct client*)arg)->exit_flag);
 
     free(arg);
 
@@ -535,27 +569,35 @@ void* listening(void* arg)
 
 
 /* Установка соединения с новым клиентом. */
-void* connecting(void* port)
+void* connecting(void* arg)
 {
     //Сокет для приёма входящих подключений.
     int sock = socket(AF_INET, SOCK_STREAM, 0);
 
-    //помечаем сокет неблокируемым
-    fcntl(sock, F_SETFL, O_NONBLOCK);
     if(sock == -1)
     {
         write_log(NULL, "[Server] Error: creating socket", ERRNO_FLAG);
         raise(SIGTERM);
-        free(port);
+        free(arg);
         pthread_exit(NULL);
+    }
+
+    //помечаем сокет неблокируемым
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    //Позволяем повторное использование локального адреса (решение TIME_WAIT)
+    {
+        int opt = 1;
+        if (setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof (opt)) == -1)
+            write_log(NULL, "[Server] Error: setsockopt", ERRNO_FLAG);
     }
 
     //Прослушиваем TCP, с указанного порта.
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(*(unsigned short int*)port);
+    addr.sin_port = htons(*(unsigned short int*)arg);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    free(port);
+    free(arg);
 
     if(bind(sock, (struct sockaddr *) &addr, sizeof(addr)) != 0)
     {
@@ -579,10 +621,12 @@ void* connecting(void* port)
     }
     write_log(NULL, "[Server] Started", 0);
 
+    struct client** clients = NULL;
+    size_t size_clients = 0;
+
     //Цикл обработки входящих соединений
     while(1)
     {
-
         int* client_sock = (int*)malloc(sizeof(int));
         if(client_sock == NULL)
         {
@@ -612,19 +656,31 @@ void* connecting(void* port)
                 tv.tv_sec = 1;
                 tv.tv_usec = 0;
                 sel_ret = select(sock+1, &set, NULL, NULL, &tv);
-                pthread_testcancel();
+                if(connecting_exit_flag)
+                {
+                    for(size_t i = 0; i < size_clients; ++i)
+                    {
+                        *(clients[i]->exit_flag) = 1;
+                    }
+                    for(size_t i = 0; i < size_clients; ++i)
+                    {
+                        pthread_join(*clients[i]->thread, NULL);
+                    }
+                    if(close(sock) < 0)
+                    {
+                        write_log(NULL, "[Server] Error: Failed to close bind socket", ERRNO_FLAG);
+                    }
+                    free(client_sock);
+                    free(client_addr);
+                    free(clients);
+                    pthread_exit(NULL);
+                }
             }
             if(sel_ret == -1)
             {
-                write_log(NULL, "[Server] Error: select", ERRNO_FLAG);
-                if(close(sock) < 0)
-                {
-                    write_log(NULL, "[Server] Error: Failed to close bind socket", ERRNO_FLAG);
-                }
                 free(client_sock);
                 free(client_addr);
-                raise(SIGTERM);
-                pthread_exit(NULL);
+                continue;
             }
         }
         //Приём подключения 
@@ -632,15 +688,27 @@ void* connecting(void* port)
         if(*client_sock < 0)
         {
             write_log(NULL, "[Server] Error: accept", ERRNO_FLAG);
+            for(size_t i = 0; i < size_clients; ++i)
+            {
+                *(clients[i]->exit_flag) = 1;
+            }
+            for(size_t i = 0; i < size_clients; ++i)
+            {
+                pthread_join(*clients[i]->thread, NULL);
+            }
             if(close(sock) < 0)
             {
                 write_log(NULL, "[Server] Error: Failed to close bind socket", ERRNO_FLAG);
             }
             free(client_sock);
             free(client_addr);
+            free(clients);
             raise(SIGTERM);
             pthread_exit(NULL);
         }
+
+        //помечаем сокет неблокируемым
+        fcntl(*client_sock, F_SETFL, O_NONBLOCK);
 
         struct client* new_client = (struct client*)malloc(sizeof(struct client));
         if(new_client == NULL)
@@ -654,9 +722,33 @@ void* connecting(void* port)
             free(client_addr);
             continue;
         }
+
+        {
+            struct client** new_clients = (struct client**)malloc(++size_clients*sizeof(struct clients*));
+            if(new_clients == NULL)
+            {
+                write_log(NULL, "[Server] Error: Failed allocate memory", 0);
+                if(close(*client_sock) < 0)
+                {
+                    write_log(NULL, "[Server] Error: Failed to close client's socket", ERRNO_FLAG);
+                }
+                free(client_sock);
+                --size_clients;
+                free(client_sock);
+                free(client_addr);
+                continue;
+            }
+            memcpy(new_clients, clients, (size_clients-1)*sizeof(struct clients*));
+            free(clients);
+            clients = new_clients;
+            clients[size_clients-1] = new_client;
+        }
+
         new_client->addr = (struct sockaddr_in*)client_addr;
         new_client->socket = client_sock;
         new_client->name = NULL;
+        new_client->thread = (pthread_t*)malloc(sizeof(pthread_t));
+        new_client->exit_flag = (unsigned char*)malloc(sizeof(unsigned char));
 
         {
             uint32_t ip = ntohl(((struct sockaddr_in *)client_addr)->sin_addr.s_addr);
@@ -669,17 +761,22 @@ void* connecting(void* port)
             {
                 write_log(NULL, "[Server] Error: Failed allocate memory", 0);
             }
-            if(sprintf(str, "[Server] new client %hhu.%hhu.%hhu.%hhu:%hu", ip_to_bytes(ip), port) < 0)
+            else
             {
-                write_log(NULL, "[Server] Error: sprintf failed", 0);
+                if(sprintf(str, "[Server] new client %hhu.%hhu.%hhu.%hhu:%hu", ip_to_bytes(ip), port) < 0)
+                {
+                    write_log(NULL, "[Server] Error: sprintf failed", 0);
+                }
+                else
+                {
+                    write_log(NULL, str, 0);
+                }
+                free(str);
             }
-            write_log(NULL, str, 0);
-            free(str);
         }
 
         //Создание нового потока
-        pthread_t thread;
-        if(pthread_create(&thread, NULL, listening, new_client) == EAGAIN)
+        if(pthread_create(new_client->thread, NULL, listening, new_client) == EAGAIN)
         {
             write_log(NULL, "[Server] Error: a system-imposed limit on the number of threads was encountered", 0);
             if(close(*client_sock) < 0)
@@ -687,16 +784,18 @@ void* connecting(void* port)
                 write_log(NULL, "[Server] Error: Failed to close client's socket", ERRNO_FLAG);
             }
             free(client_sock);
+            --size_clients;
             free(client_addr);
+            free(new_client->thread);
+            free((void*)new_client->exit_flag);
             free(new_client);
             continue;
         }
-        pthread_detach(thread);
     }
 }
 
 //Обработка некоторых ошибок (SIGFPE, SIGILL, SIGSEGV, SIGBUS)
-static void signal_error(int sig, siginfo_t *si, void *ptr)
+void signal_error(int sig, siginfo_t *si, void *ptr)
 {
     void* ErrorAddr;
     void* Trace[17];
@@ -773,6 +872,7 @@ int init_work_thread(unsigned short int p)
 {
     unsigned short int* port = (unsigned short int*)malloc(sizeof(unsigned short int));
     *port = p;
+    connecting_exit_flag = 0;
     switch(pthread_create(&thread_connecting, NULL, connecting, port))
     {
         case 0:
@@ -794,10 +894,7 @@ int init_work_thread(unsigned short int p)
 
 int destroy_work_thread()
 {
-    if(pthread_cancel(thread_connecting) != 0)
-    {
-        write_log(NULL, "[Destroy] Error: cancel", 0);
-    }
+    connecting_exit_flag = 1;
     switch(pthread_join(thread_connecting, NULL))
     {
         case 0:
@@ -1073,36 +1170,54 @@ int monitor(char* pid_file_name, unsigned short int port)
                 need_start = 1;
             }
         }
-        else // если пришел какой-либо другой ожидаемый сигнал
+        else // если пришел сигнал SIGTERM, SIGINT или SIGQUIT
         {
             // запишем в лог информацию о пришедшем сигнале
+            char* str_sig = strsignal(siginfo.si_signo);
+            char* str = (char*)malloc(sizeof(char)*(strlen(str_sig)+strlen("[MONITOR] Signal ")+1));
+            if(str == NULL)
             {
-                char* str_sig = strsignal(siginfo.si_signo);
-                char* str = (char*)malloc(sizeof(char)*(strlen(str_sig)+strlen("[MONITOR] Signal ")+1));
-                if(str == NULL)
+                write_log(NULL, "[MONITOR] Error: Failed to allocate memory", 0);
+                write_log(NULL, "[MONITOR] Undefined signal", 0);
+            }
+            else
+            {
+                if(sprintf(str, "[MONITOR] Signal %s", str_sig) < 0)
                 {
-                    write_log(NULL, "[MONITOR] Error: Failed to allocate memory", 0);
-                    write_log(NULL, "[MONITOR] Undefined signal", 0);
+                    write_log(NULL, "[MONITOR] Error: fprintf failed", 0);
                 }
                 else
                 {
-                    if(sprintf(str, "[MONITOR] Signal %s", str_sig) < 0)
+                    write_log(NULL, str, 0);
+                    kill(pid, siginfo.si_signo);
+                    if(wait(&status) < 0)
                     {
-                        write_log(NULL, "[MONITOR] Error: fprintf failed", 0);
+                        write_log(NULL, "[MONITOR] Error of waiting of a comletion code", ERRNO_FLAG);
+                        break;
                     }
+                    
+                    // преобразуем статус в нормальный вид
+                    if(WIFEXITED(status))
+                        status = WEXITSTATUS(status);
                     else
                     {
-                        write_log(NULL, str, 0);
+                        write_log(NULL, "[MONITOR] Child stopped with error", 0);
+                        status = -1;
+                        break;
                     }
-                    free(str);
+                    // если потомок завершил работу с кодом говорящем о том, что нет нужды дальше работать
+                    if (status == CHILD_NEED_TERMINATE)
+                    {        
+                        write_log(NULL, "[MONITOR] Child stopped", 0);
+                        break;
+                    }
+                    else if (status == CHILD_NEED_WORK) // если требуется перезапустить потомка
+                    {
+                        write_log(NULL, "[MONITOR] Child restart", 0);
+                        need_start = 1;
+                    }
                 }
-            }
-            
-            // убьем потомка
-            status = kill(pid, SIGTERM);
-            if(status < 0)
-            {
-                write_log(NULL, "[MONITOR] Error: Failed to send SIGTERM to child", ERRNO_FLAG);
+                free(str);
             }
             break;
         }
