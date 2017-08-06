@@ -1128,7 +1128,7 @@ int main(int argc, char** argv)
         char* log_file_name = NULL;
         for(int i = 1; i < argc; ++i)
         {
-            if(strcmp(argv[i], "-l") == 0)
+            if(strcmp(argv[i], "-l") == 0 && argc > i+1)
             {
                 log_file_name = argv[++i];
             }
@@ -1136,11 +1136,11 @@ int main(int argc, char** argv)
             {
                 interactive = 1;
             }
-            else if(strcmp(argv[i], "-pid") == 0)
+            else if(strcmp(argv[i], "-pid") == 0 && argc > i+1)
             {
                 pid_file_name = argv[++i];
             }
-            else if(strcmp(argv[i], "-port") == 0)
+            else if(strcmp(argv[i], "-port") == 0 && argc > i+1)
             {
                 port = (unsigned short int)atoi(argv[++i]);
             }
